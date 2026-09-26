@@ -126,7 +126,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:13px 12p
     <div class="form-group"><label>ID đăng nhập</label><input id="newUserId" placeholder="VD: KHACH001"></div>
     <div class="form-group"><label>Quyền sử dụng tool</label><select id="newToolAccess"><option value="A1">Tool A1</option><option value="A2">Tool A2</option><option value="A1+A2">Tool A1 + A2</option></select></div>
     <div class="form-row">
-      <div class="form-group"><label>Thời hạn</label><select id="newMonths"><option value="1">1 tháng</option><option value="3">3 tháng</option><option value="6">6 tháng</option><option value="12">12 tháng</option></select></div>
+      <div class="form-group"><label>Thời hạn</label><select id="newWeeks"><option value="1">1 tuần</option></select></div>
       <div class="form-group"><label>Số thiết bị</label><select id="newMaxDevices"><option>1</option><option>2</option><option>3</option><option>5</option><option>10</option></select></div>
     </div>
     <p class="note">KEY được sinh ngẫu nhiên. Server chỉ lưu hash của KEY.</p>
@@ -182,7 +182,7 @@ function hideCreate(){createModal.classList.remove("show")}
 async function createAccount(){
   const user_id=newUserId.value.trim();if(!user_id){alert("Hãy nhập ID.");return}
   try{
-    const d=await api("/api/admin/accounts",{method:"POST",body:JSON.stringify({user_id,tool_access:newToolAccess.value,months:Number(newMonths.value),max_devices:Number(newMaxDevices.value)})});
+    const d=await api("/api/admin/accounts",{method:"POST",body:JSON.stringify({user_id,tool_access:newToolAccess.value,weeks:Number(newWeeks.value),max_devices:Number(newMaxDevices.value)})});
     hideCreate();newUserId.value="";newKeyValue.textContent=d.key;keyModal.classList.add("show");loadAccounts();loadStats();
   }catch(e){alert(e.message)}
 }
@@ -195,12 +195,12 @@ async function loadAccounts(){
     tr.innerHTML=`<td><b>${esc(a.user_id)}</b></td><td class="code">${esc(a.key_preview)}</td><td><select onchange="changeToolAccess(${a.id},this.value)"><option value="A1" ${a.tool_access==="A1"?"selected":""}>A1</option><option value="A2" ${a.tool_access==="A2"?"selected":""}>A2</option><option value="A1+A2" ${a.tool_access==="A1+A2"?"selected":""}>A1 + A2</option></select></td><td>${esc(a.expires_at.slice(0,10))}</td>
     <td>${a.devices.length}/${a.max_devices}${a.devices.map(x=>`<div class="device"><span>${esc(x.device_name||"Thiết bị")}<br><small class="code">${esc(x.device_id.slice(0,12))}...</small></span><button class="danger" data-a="${a.id}" data-d="${escAttr(x.device_id)}">Xóa</button></div>`).join("")}</td>
     <td class="${a.locked||a.expired?"bad":"good"}">${state}</td>
-    <td><button class="secondary" onclick="extendAccount(${a.id},1)">+1 tháng</button> <button class="secondary" onclick="toggleLock(${a.id},${a.locked?0:1})">${a.locked?"Mở khóa":"Khóa"}</button> <button class="secondary" onclick="resetKey(${a.id})">Đổi KEY</button> <button class="delete-account" onclick="deleteAccount(${a.id},\'${escAttr(a.user_id)}\')">Xóa</button></td>`;
+    <td><button class="secondary" onclick="extendAccount(${a.id},1)">+1 tuần</button> <button class="secondary" onclick="toggleLock(${a.id},${a.locked?0:1})">${a.locked?"Mở khóa":"Khóa"}</button> <button class="secondary" onclick="resetKey(${a.id})">Đổi KEY</button> <button class="delete-account" onclick="deleteAccount(${a.id},\'${escAttr(a.user_id)}\')">Xóa</button></td>`;
     accountsBody.appendChild(tr);
   });
   document.querySelectorAll(".danger[data-d]").forEach(b=>b.onclick=()=>deleteDevice(Number(b.dataset.a),b.dataset.d));
 }
-async function extendAccount(id,months){await api(`/api/admin/accounts/${id}/extend`,{method:"POST",body:JSON.stringify({months})});loadAccounts();loadStats()}
+async function extendAccount(id,weeks){await api(`/api/admin/accounts/${id}/extend`,{method:"POST",body:JSON.stringify({weeks})});loadAccounts();loadStats()}
 async function changeToolAccess(id,tool_access){try{await api(`/api/admin/accounts/${id}/access`,{method:"POST",body:JSON.stringify({tool_access})});loadAccounts()}catch(e){alert(e.message);loadAccounts()}}
 async function toggleLock(id,locked){await api(`/api/admin/accounts/${id}/lock`,{method:"POST",body:JSON.stringify({locked:!!locked})});loadAccounts()}
 async function deleteDevice(id,device_id){if(!confirm("Xóa thiết bị này?"))return;await api(`/api/admin/accounts/${id}/devices/delete`,{method:"POST",body:JSON.stringify({device_id})});loadAccounts();loadStats()}

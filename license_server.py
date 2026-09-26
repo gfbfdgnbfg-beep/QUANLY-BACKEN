@@ -7,7 +7,6 @@ import base64
 import hashlib
 import secrets
 import sqlite3
-import calendar
 import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -63,6 +62,8 @@ DB_PATH = os.environ.get(
 TOOL_NAME = CONFIG.get("tool_name", "Move To Blue")
 
 VALID_TOOL_ACCESS = {"A1", "A2", "A1+A2"}
+KEY_DURATION_DAYS = 7
+SERVER_VERSION = "A1A2-WEEK-STRICT-V3"
 
 def normalize_tool_access(value):
     value = str(value or "A1").strip().upper().replace(" ", "")
@@ -153,12 +154,8 @@ def parse_iso(value):
     return datetime.datetime.fromisoformat(value)
 
 
-def add_months(dt, months):
-    total = dt.year * 12 + dt.month - 1 + int(months)
-    year, month0 = divmod(total, 12)
-    month = month0 + 1
-    day = min(dt.day, calendar.monthrange(year, month)[1])
-    return dt.replace(year=year, month=month, day=day)
+def add_days(dt, days):
+    return dt + datetime.timedelta(days=int(days))
 
 
 def hash_key(key):
@@ -262,7 +259,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return send_json(self, 200, {
                 "ok": True,
-                "service": "A1/A2 License API"
+                "service": "A1/A2 License API",
+                "version": SERVER_VERSION,
+                "key_duration_days": KEY_DURATION_DAYS
             })
 
         if path in ("/", "/admin"):
@@ -355,7 +354,29 @@ class Handler(BaseHTTPRequestHandler):
     def create_account(self):
         data = read_json(self)
         user_id = str(data.get("user_id", "")).strip()
-        months = max(1, min(120, int(data.get("months", 1))))
+
+        # V3 STRICT: API chỉ dùng đơn vị TUẦN.
+        # Request cũ dùng months/days bị từ chối rõ ràng thay vì âm thầm bỏ qua.
+        if "months" in data or "days" in data:
+            return send_json(self, 400, {
+                "ok": False,
+                "reason": "legacy_duration_not_supported",
+                "message": "API mới chỉ nhận weeks. Hãy gửi weeks: 1."
+            })
+
+        try:
+            weeks = int(data.get("weeks", 1))
+        except (TypeError, ValueError):
+            weeks = 0
+
+        if weeks != 1:
+            return send_json(self, 400, {
+                "ok": False,
+                "reason": "invalid_duration",
+                "message": "Thời hạn hiện tại cố định 1 tuần (weeks: 1)."
+            })
+
+        duration_days = weeks * 7
         max_devices = max(1, min(100, int(data.get("max_devices", 1))))
         tool_access = normalize_tool_access(data.get("tool_access", "A1"))
 
@@ -373,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
 
         plain_key = make_key()
         created = now_utc()
-        expires = add_months(created, months)
+        expires = add_days(created, duration_days)
 
         try:
             with db() as conn:
@@ -403,7 +424,8 @@ class Handler(BaseHTTPRequestHandler):
             "key": plain_key,
             "expires_at": iso(expires),
             "tool_access": tool_access,
-            "allowed_tools": allowed_tools_for(tool_access)
+            "allowed_tools": allowed_tools_for(tool_access),
+            "duration_days": duration_days
         })
 
     def get_accounts(self):
@@ -434,7 +456,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def extend_account(self, account_id):
         data = read_json(self)
-        months = max(1, min(120, int(data.get("months", 1))))
+
+        # V3 STRICT: gia hạn chỉ nhận weeks: 1.
+        # Request cũ months/days bị từ chối để tránh cộng nhầm 30 ngày.
+        if "months" in data or "days" in data:
+            return send_json(self, 400, {
+                "ok": False,
+                "reason": "legacy_duration_not_supported",
+                "message": "API mới chỉ nhận weeks. Hãy gửi weeks: 1."
+            })
+
+        try:
+            weeks = int(data.get("weeks", 1))
+        except (TypeError, ValueError):
+            weeks = 0
+
+        if weeks != 1:
+            return send_json(self, 400, {
+                "ok": False,
+                "reason": "invalid_duration",
+                "message": "Gia hạn hiện tại cố định +1 tuần (weeks: 1)."
+            })
+
+        duration_days = weeks * 7
         now = now_utc()
 
         with db() as conn:
@@ -448,14 +492,14 @@ class Handler(BaseHTTPRequestHandler):
 
             current = parse_iso(row["expires_at"])
             base = current if current > now else now
-            new_exp = add_months(base, months)
+            new_exp = add_days(base, duration_days)
 
             conn.execute(
                 "UPDATE accounts SET expires_at=? WHERE id=?",
                 (iso(new_exp), account_id)
             )
 
-        return send_json(self, 200, {"ok": True, "expires_at": iso(new_exp)})
+        return send_json(self, 200, {"ok": True, "expires_at": iso(new_exp), "duration_days": duration_days, "weeks": weeks})
 
     def lock_account(self, account_id):
         data = read_json(self)
