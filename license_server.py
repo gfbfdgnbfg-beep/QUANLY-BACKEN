@@ -63,7 +63,7 @@ TOOL_NAME = CONFIG.get("tool_name", "Move To Blue")
 
 VALID_TOOL_ACCESS = {"A1", "A2", "A1+A2"}
 KEY_DURATION_DAYS = 7
-SERVER_VERSION = "A1A2-WEEK-STRICT-V3"
+SERVER_VERSION = "A1A2-WEEK-STRICT-HISTORY-V4"
 
 def normalize_tool_access(value):
     value = str(value or "A1").strip().upper().replace(" ", "")
@@ -127,6 +127,20 @@ def init_db():
             UNIQUE(account_id,device_id),
             FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS license_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            device_id TEXT,
+            device_name TEXT,
+            event TEXT NOT NULL,
+            result TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_license_history_account_time
+        ON license_history(account_id, id DESC);
         """)
 
         # Automatic migration for databases created by the old A1-only server.
@@ -160,6 +174,26 @@ def add_days(dt, days):
 
 def hash_key(key):
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def log_license_history(conn, account, device_id, device_name, event, result):
+    """Ghi lịch sử theo thời gian server. Chỉ dùng cho CHECK_KEY/CLOSE."""
+    if not account:
+        return
+    conn.execute(
+        """INSERT INTO license_history
+           (account_id,user_id,device_id,device_name,event,result,created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            int(account["id"]),
+            str(account["user_id"]),
+            str(device_id or ""),
+            str(device_name or "")[:120],
+            str(event),
+            str(result)[:160],
+            iso(now_utc()),
+        )
+    )
 
 
 def make_key():
@@ -292,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self.get_accounts()
 
+        history_match = re.fullmatch(r"/api/admin/accounts/(\d+)/history", path)
+        if history_match:
+            if not require_admin(self):
+                return
+            return self.get_account_history(int(history_match.group(1)))
+
         return send_json(self, 404, {"ok": False, "message": "Not found"})
 
     def do_POST(self):
@@ -299,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/license/login":
             return self.license_login()
+
+        if path == "/api/license/close":
+            return self.license_close()
 
         if not path.startswith("/api/admin/"):
             return send_json(self, 404, {"ok": False, "message": "Not found"})
@@ -453,6 +496,74 @@ class Handler(BaseHTTPRequestHandler):
                 accounts.append(item)
 
         return send_json(self, 200, {"accounts": accounts})
+
+    def get_account_history(self, account_id):
+        with db() as conn:
+            account = conn.execute(
+                "SELECT id,user_id,tool_access,max_devices,expires_at,locked FROM accounts WHERE id=?",
+                (account_id,)
+            ).fetchone()
+            if not account:
+                return send_json(self, 404, {
+                    "ok": False,
+                    "message": "Không tìm thấy ID."
+                })
+
+            rows = conn.execute(
+                """SELECT id,event,result,device_id,device_name,created_at
+                   FROM license_history
+                   WHERE account_id=?
+                   ORDER BY id DESC
+                   LIMIT 300""",
+                (account_id,)
+            ).fetchall()
+
+        account_data = dict(account)
+        account_data["locked"] = bool(account_data["locked"])
+        account_data["tool_access"] = normalize_tool_access(account_data["tool_access"]) or "A1"
+        return send_json(self, 200, {
+            "ok": True,
+            "account": account_data,
+            "history": [dict(x) for x in rows],
+            "limit": 300,
+        })
+
+    def license_close(self):
+        """Best-effort close event. Không kiểm tra hạn/khóa để vẫn ghi được lúc đóng."""
+        try:
+            data = read_json(self)
+        except Exception:
+            return send_json(self, 400, {"ok": False, "message": "Dữ liệu không hợp lệ."})
+
+        user_id = str(data.get("user_id", "")).strip()
+        key = str(data.get("key", "")).strip()
+        device_id = str(data.get("device_id", "")).strip()
+        device_name = str(data.get("device_name", "")).strip()[:120]
+
+        if not user_id or not key or not device_id:
+            return send_json(self, 400, {
+                "ok": False,
+                "message": "Thiếu ID, KEY hoặc Device ID."
+            })
+
+        with db() as conn:
+            account = conn.execute(
+                "SELECT * FROM accounts WHERE user_id=? COLLATE NOCASE",
+                (user_id,)
+            ).fetchone()
+            if not account or not hmac.compare_digest(account["key_hash"], hash_key(key)):
+                return send_json(self, 403, {
+                    "ok": False,
+                    "reason": "invalid_credentials",
+                    "message": "ID hoặc KEY không đúng."
+                })
+
+            log_license_history(
+                conn, account, device_id, device_name,
+                "LAUNCHER_CLOSE", "Đã đóng launcher"
+            )
+
+        return send_json(self, 200, {"ok": True})
 
     def extend_account(self, account_id):
         data = read_json(self)
@@ -657,6 +768,8 @@ class Handler(BaseHTTPRequestHandler):
                 account["key_hash"],
                 hash_key(key)
             ):
+                if account:
+                    log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "Sai KEY")
                 return send_json(self, 403, {
                     "ok": False,
                     "reason": "invalid_credentials",
@@ -667,6 +780,7 @@ class Handler(BaseHTTPRequestHandler):
             allowed_tools = allowed_tools_for(account_tool_access)
 
             if requested_tool and requested_tool not in allowed_tools:
+                log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "Không có quyền tool")
                 return send_json(self, 403, {
                     "ok": False,
                     "reason": "tool_not_allowed",
@@ -674,6 +788,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             if account["locked"]:
+                log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "ID bị khóa")
                 return send_json(self, 403, {
                     "ok": False,
                     "reason": "account_locked",
@@ -681,6 +796,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             if parse_iso(account["expires_at"]) < now_utc():
+                log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "KEY hết hạn")
                 return send_json(self, 403, {
                     "ok": False,
                     "reason": "expired",
@@ -706,6 +822,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchone()[0]
 
                 if count >= account["max_devices"]:
+                    log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "Vượt giới hạn thiết bị")
                     return send_json(self, 403, {
                         "ok": False,
                         "reason": "device_limit",
@@ -727,6 +844,8 @@ class Handler(BaseHTTPRequestHandler):
                         current
                     )
                 )
+
+            log_license_history(conn, account, device_id, device_name, "CHECK_KEY", "Hợp lệ")
 
         return send_json(self, 200, {
             "ok": True,
